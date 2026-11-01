@@ -1,0 +1,1063 @@
+/* ============================================================
+ * CoHabitat — jeu de demonstration autonome
+ * ============================================================
+ * Permet de faire tourner l'application SANS aucun serveur :
+ * ni Supabase, ni appliance, ni reseau. Utilise pour les demos
+ * portables (une tablette, hors ligne) et pour developper une
+ * page sans monter la pile complete.
+ *
+ * Deux morceaux :
+ *
+ *   COHABITAT_DEMO      les donnees, une entree par table, deja
+ *                       mises en forme comme PostgREST les
+ *                       renverrait — jointures imbriquees
+ *                       comprises (`common_spaces: { name }`).
+ *                       C'est ce qui evite d'ecrire un moteur de
+ *                       jointures : la donnee arrive deja jointe.
+ *
+ *   createDemoClient()  un client qui imite la partie de l'API
+ *                       supabase-js reellement utilisee par
+ *                       l'application. Il filtre, trie et borne ;
+ *                       il n'ecrit rien (le mode demo est en
+ *                       consultation seule).
+ *
+ * Une table absente du jeu renvoie une liste vide, ce que
+ * l'interface affiche comme « Aucune donnee » — jamais une erreur.
+ *
+ * Charge en <script src> et non par fetch() : une page ouverte
+ * en file:// ne peut pas lire un JSON voisin.
+ * ============================================================ */
+(function (global) {
+  'use strict';
+
+  var MOI = '00000000-0000-0000-0000-0000000000d1';  // Alex Tremblay
+  var jours = function (n) { return new Date(Date.now() + n * 86400000).toISOString(); };
+  // Les colonnes date_evenement et date_cout sont de type `date` : elles
+  // attendent AAAA-MM-JJ, pas un horodatage complet.
+  var jourCourt = function (n) { return jours(n).slice(0, 10); };
+  var minutes = function (n) { return new Date(Date.now() + n * 60000).toISOString(); };
+  var heures = function (n) { return new Date(Date.now() + n * 3600000).toISOString(); };
+
+  // Eau chaude : 30 jours pour cinq logements, dont celui d'Alex
+  // (B-204). Valeurs stables d'un chargement a l'autre — une courbe qui
+  // change a chaque rechargement ferait douter de la demonstration — et
+  // le week-end consomme un peu plus.
+  var eauChaude = (function () {
+    var base = { 'B-204': 118, 'A-101': 96, 'A-102': 142, 'C-310': 74, 'C-311': 131 };
+    var lignes = [];
+    Object.keys(base).forEach(function (unit, u) {
+      for (var n = 0; n < 30; n++) {
+        var d = new Date(); d.setDate(d.getDate() - n);
+        var jour = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+        var we = (d.getDay() === 0 || d.getDay() === 6) ? 1.18 : 1;
+        var bruit = 0.85 + ((n * 37 + u * 11) % 30) / 100;
+        lignes.push({ id: 'ec-' + unit + '-' + n, jour: jour, unit: unit,
+                      litres: Math.round(base[unit] * we * bruit) });
+      }
+    });
+    return lignes;
+  })();
+
+  var DEMO = {
+    // ── Personnes ────────────────────────────────────────────
+    profiles: [
+      { id: MOI, email: 'alex.tremblay@modulimo.com', full_name: 'Alex Tremblay',
+        unit: 'B-204', role: 'demo', is_approved_driver: false, is_active: true,
+        virtual_balance: 47.50, phone: '+1 514 555-0182', resident_plan: 'network',
+        logo_bg_color: 'green', created_at: jours(-420) },
+      { id: 'p-2', email: 'camille@example.com', full_name: 'Camille Bernard',
+        unit: 'A-101', role: 'tenant', is_approved_driver: true, is_active: true,
+        virtual_balance: 62.00, created_at: jours(-380) },
+      { id: 'p-3', email: 'julien@example.com', full_name: 'Julien Moreau',
+        unit: 'C-310', role: 'tenant', is_approved_driver: true, is_active: true,
+        virtual_balance: 18.75, created_at: jours(-210) },
+    ],
+
+    dependents: [
+      { id: 'dep-demo-1', parent_id: MOI, name: 'Léa Tremblay', age: 12, pin: '1234',
+        allow_spaces: true, allow_trips: false, allow_lunch: true, virtual_balance: 15.00 },
+      { id: 'dep-demo-2', parent_id: MOI, name: 'Noah Tremblay', age: 8, pin: '5678',
+        allow_spaces: false, allow_trips: false, allow_lunch: true, virtual_balance: 8.25 },
+    ],
+
+    // ── Machine Lunch ────────────────────────────────────────
+    // La page Lunch interroge normalement la centrale Modulimo par HTTP
+    // et ouvre le kiosque dans un onglet. Rien de tout cela n'est
+    // joignable hors ligne : ces trois tables et COHABITAT_DEMO_REST les
+    // remplacent, pour que la file d'attente soit reellement utilisable
+    // en demonstration.
+    lunch_machines: [
+      { id: 'demo-lm-1', name: 'Machine — Hall d\u2019entrée', building_id: 'demo', active: true },
+      { id: 'demo-lm-2', name: 'Machine — Salle commune',   building_id: 'demo', active: true },
+    ],
+
+    // Une machine libre, une occupee avec quelqu'un en attente : les trois
+    // etats de la carte sont visibles d'entree de jeu.
+    lunch_queue: [
+      { id: 'lq-1', machine_id: 'demo-lm-2', user_id: 'p-2', full_name: 'Camille Bernard',
+        unit: 'A-101', status: 'active',  joined_at: minutes(-4),
+        expires_at: minutes(6) },
+      { id: 'lq-2', machine_id: 'demo-lm-2', user_id: 'p-3', full_name: 'Julien Moreau',
+        unit: 'C-310', status: 'waiting', joined_at: minutes(-2),
+        expires_at: minutes(8) },
+    ],
+
+    lunch_sessions: [],
+
+    // ── Espaces communs ──────────────────────────────────────
+    common_spaces: [
+      { id: 'sp-1', name: 'Salon commun A', description: 'Grande pièce lumineuse, cuisine attenante.',
+        capacity: 25, location: 'Rez-de-chaussée, aile A', is_available: true,
+        federation_shared: false, space_pricing: [{ price_per_slot: 3.00 }] },
+      { id: 'sp-2', name: 'Salle de réunion', description: 'Table de 10, écran, tableau blanc.',
+        capacity: 10, location: '2e étage', is_available: true,
+        federation_shared: false, space_pricing: [{ price_per_slot: 2.00 }] },
+      { id: 'sp-3', name: 'Terrasse sur le toit', description: 'Vue sur le fleuve, BBQ, mobilier.',
+        capacity: 30, location: '8e étage', is_available: true,
+        federation_shared: true, space_pricing: [{ price_per_slot: 4.00 }] },
+      { id: 'sp-4', name: 'Atelier de bricolage', description: 'Établi, outils, imprimante 3D.',
+        capacity: 6, location: 'Sous-sol', is_available: true,
+        federation_shared: false, space_pricing: [{ price_per_slot: 2.50 }] },
+    ],
+
+    space_pricing: [
+      { id: 'pr-1', space_id: 'sp-1', price_per_slot: 3.00 },
+      { id: 'pr-2', space_id: 'sp-2', price_per_slot: 2.00 },
+      { id: 'pr-3', space_id: 'sp-3', price_per_slot: 4.00 },
+      { id: 'pr-4', space_id: 'sp-4', price_per_slot: 2.50 },
+    ],
+
+    space_reservations: [
+      { id: 'rs-1', space_id: 'sp-1', tenant_id: MOI, start_time: heures(30), end_time: heures(33),
+        total_slots: 12, total_cost: 36.00, status: 'confirmed', is_demo: false,
+        created_at: jours(-2), common_spaces: { name: 'Salon commun A' } },
+      { id: 'rs-2', space_id: 'sp-3', tenant_id: MOI, start_time: jours(-6), end_time: jours(-6),
+        total_slots: 8, total_cost: 32.00, status: 'completed', is_demo: false,
+        created_at: jours(-9), common_spaces: { name: 'Terrasse sur le toit' } },
+      { id: 'rs-3', space_id: 'sp-2', tenant_id: 'p-2', start_time: heures(54), end_time: heures(56),
+        total_slots: 8, total_cost: 16.00, status: 'confirmed', is_demo: false,
+        created_at: jours(-1), common_spaces: { name: 'Salle de réunion' } },
+    ],
+
+    // ── Véhicules et trajets ─────────────────────────────────
+    vehicles: [
+      { id: 'vh-1', model: 'Minivan électrique 1', license_plate: 'MV-01', seat_count: 7, seats: 7,
+        vehicle_type: 'auto', is_reservable: true, odometer_km: 18432.5, is_available: true, color: 'Blanc',
+        cargo_capacity_m3: 1.2, cargo_slots: 3, notes: 'Recharge au sous-sol, câble dans le coffre.',
+        vehicle_pricing: [{ price_per_minute: 0.20, price_per_km: 0.35, price_per_cargo_slot: 2.00 }] },
+      { id: 'vh-2', model: 'Vélomobile 1', license_plate: 'VM-01', seat_count: 1, seats: 1,
+        vehicle_type: 'velomobile', is_reservable: true, odometer_km: 1204.0, is_available: true, color: 'Jaune',
+        cargo_capacity_m3: 0.15, cargo_slots: 1, notes: 'Vélomobile caréné. Casque fourni au local à vélos.',
+        vehicle_pricing: [{ price_per_minute: 0.02, price_per_km: 0, price_per_cargo_slot: 0 }] },
+      { id: 'vh-3', model: 'Vélomobile 2', license_plate: 'VM-02', seat_count: 1, seats: 1,
+        vehicle_type: 'velomobile', is_reservable: true, odometer_km: 967.5, is_available: true, color: 'Bleu',
+        cargo_capacity_m3: 0.15, cargo_slots: 1, notes: 'Vélomobile caréné, coffre arrière un peu plus grand.',
+        vehicle_pricing: [{ price_per_minute: 0.02, price_per_km: 0, price_per_cargo_slot: 0 }] },
+      { id: 'vh-4', model: 'Minivan électrique 2', license_plate: 'MV-02', seat_count: 7, seats: 7,
+        vehicle_type: 'auto', is_reservable: true, odometer_km: 9871.0, is_available: true, color: 'Gris',
+        cargo_capacity_m3: 1.2, cargo_slots: 3, notes: 'Attelage pour la remorque du jardin.',
+        vehicle_pricing: [{ price_per_minute: 0.20, price_per_km: 0.35, price_per_cargo_slot: 2.00 }] },
+    ],
+
+    vehicle_pricing: [
+      { id: 'vp-1', vehicle_id: 'vh-1', price_per_minute: 0.20, price_per_km: 0.35, price_per_cargo_slot: 2.00 },
+      { id: 'vp-2', vehicle_id: 'vh-2', price_per_minute: 0.02, price_per_km: 0, price_per_cargo_slot: 0 },
+      { id: 'vp-3', vehicle_id: 'vh-3', price_per_minute: 0.02, price_per_km: 0, price_per_cargo_slot: 0 },
+      { id: 'vp-4', vehicle_id: 'vh-4', price_per_minute: 0.20, price_per_km: 0.35, price_per_cargo_slot: 2.00 },
+    ],
+
+    // Reservations directes : celle du visiteur (a venir) et une prise par
+    // quelqu'un d'autre, pour que la pastille « occupe » ait un cas a
+    // montrer. La RLS ne laisserait pas voir la seconde en vrai — ici elle
+    // ne sert qu'a alimenter vehicle_busy_slots.
+    vehicle_reservations: [
+      { id: 'vr-1', vehicle_id: 'vh-2', tenant_id: MOI, start_time: heures(26), end_time: heures(28),
+        total_minutes: 120, time_cost: 2.40, total_cost: 2.40, purpose: 'Aller au marché', status: 'confirmed',
+        created_at: jours(-1), vehicles: { model: 'Vélomobile 1', vehicle_type: 'velomobile', license_plate: 'VM-01' } },
+      { id: 'vr-2', vehicle_id: 'vh-3', tenant_id: 'p-2', start_time: heures(-1), end_time: heures(2),
+        total_minutes: 180, time_cost: 3.60, total_cost: 3.60, purpose: null, status: 'confirmed',
+        created_at: jours(-2), vehicles: { model: 'Vélomobile 2', vehicle_type: 'velomobile', license_plate: 'VM-02' } },
+      // Une minivan en cours d'utilisation : c'est celle-ci qui permet de
+      // jouer le retour et la declaration des kilometres. Le velomobile
+      // ne le propose pas — son kilometre est gratuit, le temps suffit a
+      // le facturer.
+      { id: 'vr-3', vehicle_id: 'vh-1', tenant_id: MOI, start_time: heures(-1), end_time: heures(0.5),
+        total_minutes: 90, time_cost: 18.00, deposit_cost: 18.00, total_cost: 18.00,
+        purpose: 'Épicerie et quincaillerie', status: 'in_progress',
+        started_at: minutes(-38), km_start: 18432.5, created_at: jours(-1),
+        vehicles: { model: 'Minivan électrique 1', vehicle_type: 'auto', license_plate: 'MV-01' } },
+      // Creneau commence, vehicule pas encore pris : c'est celle-ci qui
+      // fait jouer la confirmation du compteur.
+      { id: 'vr-4', vehicle_id: 'vh-4', tenant_id: MOI, start_time: minutes(-10), end_time: heures(2),
+        total_minutes: 130, time_cost: 26.00, deposit_cost: 26.00, total_cost: 26.00,
+        purpose: 'Aller chercher un meuble', status: 'confirmed', created_at: jours(-1),
+        vehicles: { model: 'Minivan électrique 2', vehicle_type: 'auto', license_plate: 'MV-02' } },
+    ],
+
+    // Les colonnes suivent celles de la table `trips` et de la vue
+    // `trips_with_details` (schema.sql) : available_seats et non
+    // seats_available, cargo_available_pct, booked_seats. Les noms
+    // employes ici auparavant n'existaient nulle part, si bien que chaque
+    // carte affichait « Complet » et « Cargo: NaN% ».
+    trips: [
+      { id: 'tr-3', title: 'Sortie au parc — Mont-Royal', driver_id: 'p-2', vehicle_id: 'vh-1',
+        departure_time: heures(6), available_seats: 4, cargo_available_pct: 100,
+        estimated_distance_km: 12.4, status: 'published', is_demo: false,
+        departure_point: 'Entrée principale', destination: 'Lac aux Castors' },
+      { id: 'tr-1', title: 'Épicerie — Marché Jean-Talon', driver_id: 'p-2', vehicle_id: 'vh-1',
+        departure_time: heures(20), available_seats: 4, cargo_available_pct: 100,
+        estimated_distance_km: 7.5, status: 'published', is_demo: false,
+        departure_point: 'Entrée principale', destination: 'Marché Jean-Talon' },
+      { id: 'tr-2', title: 'Centre-ville — bureaux', driver_id: 'p-3', vehicle_id: 'vh-1',
+        departure_time: heures(44), available_seats: 4, cargo_available_pct: 100,
+        estimated_distance_km: 9.1, status: 'published', is_demo: false,
+        departure_point: 'Stationnement B', destination: 'Square Victoria' },
+    ],
+
+    // Trois etats differents a l'affichage : presque complet, une place
+    // deja reservee par le visiteur, et largement disponible.
+    trips_with_details: [
+      { id: 'tr-3', title: 'Sortie au parc — Mont-Royal', driver_id: 'p-2',
+        driver_name: 'Camille Bernard', driver_unit: 'A-101',
+        vehicle_id: 'vh-1', vehicle_model: 'Minivan électrique 1', license_plate: 'MV-01',
+        departure_time: heures(6), available_seats: 4, booked_seats: 3,
+        cargo_available_pct: 100, booked_cargo_pct: 40, estimated_distance_km: 12.4,
+        price_per_minute: 0.20, price_per_km: 0.35, price_per_cargo_slot: 2.00,
+        status: 'published', is_demo: false,
+        departure_point: 'Entrée principale', destination: 'Lac aux Castors' },
+      { id: 'tr-1', title: 'Épicerie — Marché Jean-Talon', driver_id: 'p-2',
+        driver_name: 'Camille Bernard', driver_unit: 'A-101',
+        vehicle_id: 'vh-1', vehicle_model: 'Minivan électrique 1', license_plate: 'MV-01',
+        departure_time: heures(20), available_seats: 4, booked_seats: 1,
+        cargo_available_pct: 100, booked_cargo_pct: 20, estimated_distance_km: 7.5,
+        price_per_minute: 0.20, price_per_km: 0.35, price_per_cargo_slot: 2.00,
+        status: 'published', is_demo: false,
+        departure_point: 'Entrée principale', destination: 'Marché Jean-Talon' },
+      { id: 'tr-2', title: 'Centre-ville — bureaux', driver_id: 'p-3',
+        driver_name: 'Julien Moreau', driver_unit: 'C-310',
+        vehicle_id: 'vh-1', vehicle_model: 'Minivan électrique 1', license_plate: 'MV-01',
+        departure_time: heures(44), available_seats: 4, booked_seats: 2,
+        cargo_available_pct: 100, booked_cargo_pct: 0, estimated_distance_km: 9.1,
+        price_per_minute: 0.20, price_per_km: 0.35, price_per_cargo_slot: 2.00,
+        status: 'published', is_demo: false,
+        departure_point: 'Stationnement B', destination: 'Square Victoria' },
+    ],
+
+    trip_bookings: [
+      // `status` doit valoir accepted ou pending : renderTripBookings n'offre
+      // le bouton Annuler que pour ces deux valeurs, et statusLabel ne
+      // connait pas « confirmed ». L'embarque `trips` doit aussi porter la
+      // destination, affichee en colonne.
+      { id: 'tb-1', trip_id: 'tr-1', passenger_id: MOI, seats_requested: 1, status: 'accepted',
+        total_cost: 4.25, is_demo: false, created_at: jours(-1),
+        pickup_location: 'Entrée principale',
+        trips: { title: 'Épicerie — Marché Jean-Talon', departure_time: heures(20),
+                 destination: 'Marché Jean-Talon' },
+        profiles: { full_name: 'Alex Tremblay', unit: 'B-204' } },
+      { id: 'tb-2', trip_id: 'tr-2', passenger_id: MOI, seats_requested: 2, status: 'pending',
+        total_cost: 6.80, is_demo: false, created_at: jours(-2),
+        pickup_location: 'Stationnement B',
+        trips: { title: 'Centre-ville — bureaux', departure_time: heures(44),
+                 destination: 'Square Victoria' },
+        profiles: { full_name: 'Alex Tremblay', unit: 'B-204' } },
+      // Une course passee, pour que l'onglet montre aussi son historique.
+      { id: 'tb-3', trip_id: 'tr-0', passenger_id: MOI, seats_requested: 1, status: 'accepted',
+        total_cost: 3.15, is_demo: false, created_at: jours(-9),
+        pickup_location: 'Entrée principale',
+        trips: { title: 'Pharmacie — Jean Coutu', departure_time: heures(-160),
+                 destination: 'Jean Coutu Masson' },
+        profiles: { full_name: 'Alex Tremblay', unit: 'B-204' } },
+    ],
+
+    trip_stops: [
+      { id: 'ts-1', trip_id: 'tr-1', label: 'Coin Papineau / Mont-Royal', stop_order: 1 },
+    ],
+
+    passenger_requests: [
+      { id: 'pq-1', requester_id: 'p-3', requester_name: 'Julien Moreau', departure_point: 'Immeuble',
+        destination: 'Aéroport YUL', desired_datetime: heures(72), seats_requested: 2,
+        luggage_ft3: 8, status: 'open', is_demo: false, created_at: jours(-1) },
+    ],
+
+    // ── Argent ───────────────────────────────────────────────
+    transactions: [
+      { id: 'tx-1', user_id: MOI, amount: -12.00, balance_after: 47.50, type: 'space_reservation',
+        description: 'Réservation Salon commun A', created_at: jours(-1), is_demo: false },
+      { id: 'tx-2', user_id: MOI, amount: 50.00, balance_after: 59.50, type: 'admin_credit',
+        description: 'Crédit par administrateur', created_at: jours(-3), is_demo: false },
+      { id: 'tx-3', user_id: MOI, amount: -8.50, balance_after: 9.50, type: 'admin_credit',
+        description: 'Machine lunch — Case #3 : Poulet rôti', created_at: jours(-5), is_demo: false },
+      { id: 'tx-4', user_id: MOI, amount: -6.00, balance_after: 18.00, type: 'space_reservation',
+        description: 'Réservation Salle de réunion', created_at: jours(-7), is_demo: false },
+      { id: 'tx-5', user_id: MOI, amount: 25.00, balance_after: 24.00, type: 'admin_credit',
+        description: 'Crédit par administrateur', created_at: jours(-10), is_demo: false },
+    ],
+
+    real_payments: [
+      { id: 'rp-1', tenant_id: MOI, amount: 100.00, method: 'virement', created_at: jours(-21),
+        note: 'Paiement mensuel', profiles: { id: MOI, full_name: 'Alex Tremblay' } },
+    ],
+
+    // ── Vie de l'immeuble ────────────────────────────────────
+    bulletin_board: [
+      { id: 'bb-1', user_id: 'p-2', content: 'Je donne un vélo d’enfant en bon état, 20 pouces. Écrivez-moi !',
+        created_at: jours(-1), profiles: { full_name: 'Camille Bernard' } },
+      { id: 'bb-2', user_id: 'p-3', content: 'Corvée de jardin samedi 10 h, on plante les tomates. Café offert.',
+        created_at: jours(-3), profiles: { full_name: 'Julien Moreau' } },
+      { id: 'bb-3', user_id: MOI, content: 'Merci à qui a rentré mes paquets hier soir 🙏',
+        created_at: jours(-4), profiles: { full_name: 'Alex Tremblay' } },
+    ],
+
+    tickets: [
+      { id: 'tk-1', user_id: MOI, subject: 'Robinet qui goutte — cuisine', category: 'maintenance',
+        priority: 'normal', status: 'in_progress', description: 'Depuis lundi, goutte à goutte constant.',
+        created_at: jours(-4), updated_at: jours(-2), profiles: { full_name: 'Alex Tremblay' } },
+      { id: 'tk-2', user_id: MOI, subject: 'Ampoule grillée — corridor 2e', category: 'maintenance',
+        priority: 'low', status: 'resolved', description: 'Deuxième plafonnier en partant de l’ascenseur.',
+        created_at: jours(-18), updated_at: jours(-15), resolved_at: jours(-15),
+        profiles: { full_name: 'Alex Tremblay' } },
+    ],
+
+    ticket_messages: [
+      { id: 'tm-1', ticket_id: 'tk-1', user_id: MOI, message: 'Bonjour, toujours pas réglé ce matin.',
+        created_at: jours(-2), profiles: { full_name: 'Alex Tremblay' } },
+      { id: 'tm-2', ticket_id: 'tk-1', user_id: 'p-2', message: 'Le plombier passe jeudi après-midi.',
+        created_at: jours(-1), profiles: { full_name: 'Concierge' } },
+    ],
+
+    // ── Serre ────────────────────────────────────────────────
+    serre_zones: [
+      { id: 'sz-1', code: 'A1', nom: 'Bac A1', surface_m2: 2.0, statut: 'louee' },
+      { id: 'sz-2', code: 'A2', nom: 'Bac A2', surface_m2: 2.0, statut: 'libre' },
+      { id: 'sz-3', code: 'B1', nom: 'Bac B1', surface_m2: 3.5, statut: 'libre' },
+    ],
+
+    serre_locations: [
+      { id: 'sl-1', zone_id: 'sz-1', locataire_id: MOI, date_debut: jours(-60), date_fin: jours(120),
+        frais_mensuel: 12.00, statut: 'active', serre_zones: { code: 'A1' },
+        profiles: { full_name: 'Alex Tremblay' } },
+    ],
+
+    serre_cultures: [
+      { id: 'sc-1', location_id: 'sl-1', zone_id: 'sz-1', espece: 'Tomate cerise', variete: 'Sungold',
+        stade: 'fructification', date_semis: jours(-55), date_repiquage: jours(-35), statut: 'en_cours' },
+      { id: 'sc-2', location_id: 'sl-1', zone_id: 'sz-1', espece: 'Basilic', variete: 'Genovese',
+        stade: 'recolte_continue', date_semis: jours(-40), statut: 'en_cours' },
+    ],
+
+    serre_recoltes: [
+      { id: 'sr-1', culture_id: 'sc-1', date_recolte: jours(-6), quantite: 0.8, unite: 'kg' },
+      { id: 'sr-2', culture_id: 'sc-2', date_recolte: jours(-2), quantite: 0.12, unite: 'kg' },
+    ],
+
+    serre_recoltes_cumul: [
+      { culture_id: 'sc-1', espece: 'Tomate cerise', total: 2.4, unite: 'kg' },
+      { culture_id: 'sc-2', espece: 'Basilic', total: 0.45, unite: 'kg' },
+    ],
+
+    // Noms de colonnes repris de sql/009_serre.sql : horodatage,
+    // reservoirN_temp, reservoirN_pct. Le jeu precedent employait
+    // mesure_at / temp_reservoir1 / niveau1_pct, qui n'existent pas —
+    // les conditions s'affichaient donc vides en demonstration.
+    serre_lectures: [
+      { id: 'sle-1', horodatage: heures(-1), temp_air: 22.4,
+        reservoir1_temp: 18.9, reservoir2_temp: 19.4, reservoir3_temp: 18.2,
+        reservoir1_pct: 76, reservoir2_pct: 63, reservoir3_pct: 88 },
+      { id: 'sle-2', horodatage: heures(-4), temp_air: 21.1,
+        reservoir1_temp: 18.7, reservoir2_temp: 19.1, reservoir3_temp: 18.0,
+        reservoir1_pct: 78, reservoir2_pct: 65, reservoir3_pct: 89 },
+      { id: 'sle-3', horodatage: heures(-8), temp_air: 19.8,
+        reservoir1_temp: 18.5, reservoir2_temp: 18.9, reservoir3_temp: 17.9,
+        reservoir1_pct: 80, reservoir2_pct: 67, reservoir3_pct: 90 },
+    ],
+
+    // ── Cameras ──────────────────────────────────────────────
+    // Meme forme que CohabitatConfig.cameras. L'exemple que montre la
+    // demonstration : l'entree visible par tous les residants, avec son
+    // avis de videosurveillance ; le garage et le local technique
+    // reserves aux administrateurs. Sans serveur camera sur la tablette,
+    // chaque camera montre une image dessinee par l'application, ou une
+    // sequence en boucle si `demoVideo` pointe vers un fichier (MP4 ou
+    // WebM, sans personne ni plaque identifiable : la demo est publique).
+    cameras: {
+      enabled: true,
+      avis: {
+        responsable: { fr: 'Gestion de l’immeuble', en: 'Building management', es: 'Administración del edificio', zh: '楼宇管理处' },
+        contact: 'gestion@immeuble-demo.ca',
+        conservation: { fr: '7 jours', en: '7 days', es: '7 días', zh: '7 天' },
+        politiqueUrl: 'https://www.modulimo.com/confidentialite/'
+      },
+      liste: [
+        // Video en boucle : deposer le fichier dans img/demo/ (voir son
+        // README). Absent, l'image dessinee reste affichee.
+        { id: 'cam-entree', demoScene: 'entree', visibility: 'tenants', demoVideo: 'img/demo/camera-entree.mp4',
+          label: { fr: 'Entrée principale', en: 'Main entrance', es: 'Entrada principal', zh: '主入口' },
+          finalite: { fr: 'Sécurité des accès : voir qui se présente à la porte, accueillir une livraison.',
+                      en: 'Access security: see who is at the door, receive a delivery.',
+                      es: 'Seguridad de los accesos: ver quién llega a la puerta, recibir una entrega.',
+                      zh: '出入安全：查看门口来访者，接收快递。' } },
+        { id: 'cam-garage', demoScene: 'garage', visibility: 'admin', demoVideo: 'img/demo/camera-garage.mp4',
+          label: { fr: 'Garage', en: 'Garage', es: 'Garaje', zh: '车库' },
+          description: { fr: 'Stationnement et bornes de recharge.', en: 'Parking and charging stations.',
+                         es: 'Estacionamiento y cargadores.', zh: '停车位与充电桩。' } },
+        { id: 'cam-technique', demoScene: 'entree', visibility: 'admin', demoVideo: 'img/demo/camera-technique.mp4',
+          label: { fr: 'Local technique', en: 'Utility room', es: 'Cuarto técnico', zh: '设备间' },
+          description: { fr: 'Serveur de l’immeuble, batterie et réservoir d’eau chaude.',
+                         en: 'Building server, battery and hot water tank.',
+                         es: 'Servidor del edificio, batería y depósito de agua caliente.',
+                         zh: '楼宇服务器、电池与热水箱。' } },
+      ],
+    },
+
+    // ── Energie et confort ───────────────────────────────────
+    immeuble_etat: [
+      { id: 'ie-1', horodatage: heures(-30), mode: 'normal', niveau: 'vert', message: null },
+    ],
+    energie_lectures: [
+      { id: 'el-1', horodatage: minutes(-12), solaire_kw: 3.8, solaire_kwh_jour: 17.6,
+        batterie_pct: 94, reseau_kw: -0.6, reservoir_temp: 62, eau_chaude_couverture_pct: 91 },
+      { id: 'el-2', horodatage: minutes(-27), solaire_kw: 3.5, solaire_kwh_jour: 16.7,
+        batterie_pct: 93, reseau_kw: -0.3, reservoir_temp: 61, eau_chaude_couverture_pct: 90 },
+    ],
+    eau_chaude_compteurs: eauChaude,
+    // La troisieme alerte (A-101) n'est pas celle d'Alex : l'ecran la
+    // filtre comme la RLS le ferait.
+    immeuble_alertes: [
+      { id: 'ia-1', horodatage: heures(-50), type: 'gel', gravite: 'attention', unit: null,
+        titre: 'Température basse au garage', message: 'Le chauffage d’appoint a pris le relais. Fermez bien la porte en sortant.',
+        nb_notifies: 1, resolue_le: null },
+      { id: 'ia-2', horodatage: jours(-12), type: 'fuite', gravite: 'urgence', unit: 'B-204',
+        titre: 'Fuite sous le lave-vaisselle', message: 'La vanne d’eau du logement a été fermée automatiquement. Un plombier est passé le jour même.',
+        nb_notifies: 2, resolue_le: jours(-12) },
+      { id: 'ia-3', horodatage: jours(-3), type: 'panne', gravite: 'info', unit: 'A-101',
+        titre: 'Thermostat de chambre injoignable', message: null, nb_notifies: 1, resolue_le: jours(-2) },
+    ],
+
+    // Fiches individuelles. Les portraits sont des SVG embarques :
+    // la demonstration doit fonctionner sans reseau, sur la tablette
+    // comme ailleurs. Un vrai deploiement y met des adresses web.
+    elevage_animaux: [
+      { id: 'ea-1', module: 'poulailler', nom: 'Doucette', race: 'Rousse',
+        date_arrivee: jourCourt(-300), statut: 'age', notes: 'la plus douce, se laisse prendre sans bouger — la doyenne',
+        photo_url: 'data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2080%2060%22%3E%3Crect%20width%3D%2280%22%20height%3D%2260%22%20fill%3D%22%232a2622%22/%3E%3Cellipse%20cx%3D%2240%22%20cy%3D%2240%22%20rx%3D%2221%22%20ry%3D%2215%22%20fill%3D%22%23b86134%22/%3E%3Ccircle%20cx%3D%2255%22%20cy%3D%2225%22%20r%3D%229%22%20fill%3D%22%23b86134%22/%3E%3Cpath%20d%3D%22M52%2016c1-4%204-4%204%200%201-4%204-4%204%201%201-3%203-2%203%201z%22%20fill%3D%22%23c0392b%22/%3E%3Cpath%20d%3D%22M56%2032q3%203%200%205-3-2%200-5z%22%20fill%3D%22%23c0392b%22/%3E%3Ccircle%20cx%3D%2258%22%20cy%3D%2224%22%20r%3D%221.6%22%20fill%3D%22%231a1a1a%22/%3E%3Cpath%20d%3D%22M64%2027l6%202-6%202z%22%20fill%3D%22%23e8a33d%22/%3E%3Cpath%20d%3D%22M20%2038q10-8%2018%202-9%206-18-2z%22%20fill%3D%22%238e4726%22/%3E%3Cpath%20d%3D%22M19%2034q-6-3-8%202%205%201%209%202z%22%20fill%3D%22%238e4726%22/%3E%3Cpath%20d%3D%22M24%2052l-2%205M32%2053l-1%205%22%20stroke%3D%22%23e8a33d%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22/%3E%3C/svg%3E' },
+      { id: 'ea-2', module: 'poulailler', nom: 'Noisette', race: 'Rousse',
+        date_arrivee: jourCourt(-300), statut: 'adulte', notes: 'robe plus claire, couleur noisette',
+        photo_url: 'data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2080%2060%22%3E%3Crect%20width%3D%2280%22%20height%3D%2260%22%20fill%3D%22%23262a28%22/%3E%3Cellipse%20cx%3D%2240%22%20cy%3D%2240%22%20rx%3D%2221%22%20ry%3D%2215%22%20fill%3D%22%23cd8149%22/%3E%3Ccircle%20cx%3D%2255%22%20cy%3D%2225%22%20r%3D%229%22%20fill%3D%22%23cd8149%22/%3E%3Cpath%20d%3D%22M52%2016c1-4%204-4%204%200%201-4%204-4%204%201%201-3%203-2%203%201z%22%20fill%3D%22%23c0392b%22/%3E%3Cpath%20d%3D%22M56%2032q3%203%200%205-3-2%200-5z%22%20fill%3D%22%23c0392b%22/%3E%3Ccircle%20cx%3D%2258%22%20cy%3D%2224%22%20r%3D%221.6%22%20fill%3D%22%231a1a1a%22/%3E%3Cpath%20d%3D%22M64%2027l6%202-6%202z%22%20fill%3D%22%23e8a33d%22/%3E%3Cpath%20d%3D%22M20%2038q10-8%2018%202-9%206-18-2z%22%20fill%3D%22%23a35f30%22/%3E%3Cpath%20d%3D%22M19%2034q-6-3-8%202%205%201%209%202z%22%20fill%3D%22%23a35f30%22/%3E%3Cpath%20d%3D%22M24%2052l-2%205M32%2053l-1%205%22%20stroke%3D%22%23e8a33d%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22/%3E%3C/svg%3E' },
+      { id: 'ea-3', module: 'poulailler', nom: 'Long Bec', race: 'Rousse',
+        date_arrivee: jourCourt(-300), statut: 'age', notes: 'bec nettement plus long que les autres — âgée, elle aussi',
+        photo_url: 'data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2080%2060%22%3E%3Crect%20width%3D%2280%22%20height%3D%2260%22%20fill%3D%22%232a2422%22/%3E%3Cellipse%20cx%3D%2240%22%20cy%3D%2240%22%20rx%3D%2221%22%20ry%3D%2215%22%20fill%3D%22%23a85630%22/%3E%3Ccircle%20cx%3D%2255%22%20cy%3D%2225%22%20r%3D%229%22%20fill%3D%22%23a85630%22/%3E%3Cpath%20d%3D%22M52%2016c1-4%204-4%204%200%201-4%204-4%204%201%201-3%203-2%203%201z%22%20fill%3D%22%23c0392b%22/%3E%3Cpath%20d%3D%22M56%2032q3%203%200%205-3-2%200-5z%22%20fill%3D%22%23c0392b%22/%3E%3Ccircle%20cx%3D%2258%22%20cy%3D%2224%22%20r%3D%221.6%22%20fill%3D%22%231a1a1a%22/%3E%3Cpath%20d%3D%22M64%2027l11%202-11%202z%22%20fill%3D%22%23e8a33d%22/%3E%3Cpath%20d%3D%22M20%2038q10-8%2018%202-9%206-18-2z%22%20fill%3D%22%23833f22%22/%3E%3Cpath%20d%3D%22M19%2034q-6-3-8%202%205%201%209%202z%22%20fill%3D%22%23833f22%22/%3E%3Cpath%20d%3D%22M24%2052l-2%205M32%2053l-1%205%22%20stroke%3D%22%23e8a33d%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22/%3E%3C/svg%3E' },
+      { id: 'ea-4', module: 'poulailler', nom: 'Petite Crête', race: 'Rousse',
+        date_arrivee: jourCourt(-40), statut: 'jeune', notes: 'crête basse — la dernière arrivée, encore jeune',
+        photo_url: 'data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2080%2060%22%3E%3Crect%20width%3D%2280%22%20height%3D%2260%22%20fill%3D%22%23282622%22/%3E%3Cellipse%20cx%3D%2240%22%20cy%3D%2240%22%20rx%3D%2221%22%20ry%3D%2215%22%20fill%3D%22%23c47340%22/%3E%3Ccircle%20cx%3D%2255%22%20cy%3D%2225%22%20r%3D%229%22%20fill%3D%22%23c47340%22/%3E%3Cpath%20d%3D%22M53%2019c1-2%203-2%203%200%201-2%203-2%203%201%201-2%202-1%202%201z%22%20fill%3D%22%23c0392b%22/%3E%3Cpath%20d%3D%22M56%2032q3%203%200%205-3-2%200-5z%22%20fill%3D%22%23c0392b%22/%3E%3Ccircle%20cx%3D%2258%22%20cy%3D%2224%22%20r%3D%221.6%22%20fill%3D%22%231a1a1a%22/%3E%3Cpath%20d%3D%22M64%2027l6%202-6%202z%22%20fill%3D%22%23e8a33d%22/%3E%3Cpath%20d%3D%22M20%2038q10-8%2018%202-9%206-18-2z%22%20fill%3D%22%239a5529%22/%3E%3Cpath%20d%3D%22M19%2034q-6-3-8%202%205%201%209%202z%22%20fill%3D%22%239a5529%22/%3E%3Cpath%20d%3D%22M24%2052l-2%205M32%2053l-1%205%22%20stroke%3D%22%23e8a33d%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22/%3E%3C/svg%3E' },
+      { id: 'ea-5', module: 'poulailler', nom: 'Coquette', race: 'Rousse',
+        date_arrivee: jourCourt(-300), date_sortie: jourCourt(-96), statut: 'mort', notes: 'Prédation — la clôture a été renforcée depuis',
+        photo_url: 'data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2080%2060%22%3E%3Crect%20width%3D%2280%22%20height%3D%2260%22%20fill%3D%22%23242220%22/%3E%3Cellipse%20cx%3D%2240%22%20cy%3D%2240%22%20rx%3D%2221%22%20ry%3D%2215%22%20fill%3D%22%239c5730%22/%3E%3Ccircle%20cx%3D%2255%22%20cy%3D%2225%22%20r%3D%229%22%20fill%3D%22%239c5730%22/%3E%3Cpath%20d%3D%22M52%2016c1-4%204-4%204%200%201-4%204-4%204%201%201-3%203-2%203%201z%22%20fill%3D%22%23c0392b%22/%3E%3Cpath%20d%3D%22M56%2032q3%203%200%205-3-2%200-5z%22%20fill%3D%22%23c0392b%22/%3E%3Ccircle%20cx%3D%2258%22%20cy%3D%2224%22%20r%3D%221.6%22%20fill%3D%22%231a1a1a%22/%3E%3Cpath%20d%3D%22M64%2027l6%202-6%202z%22%20fill%3D%22%23e8a33d%22/%3E%3Cpath%20d%3D%22M20%2038q10-8%2018%202-9%206-18-2z%22%20fill%3D%22%237a4022%22/%3E%3Cpath%20d%3D%22M19%2034q-6-3-8%202%205%201%209%202z%22%20fill%3D%22%237a4022%22/%3E%3Cpath%20d%3D%22M24%2052l-2%205M32%2053l-1%205%22%20stroke%3D%22%23e8a33d%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22/%3E%3C/svg%3E' },
+    ],
+
+    // Ce qui est a partager cette semaine. Aucun prix : distribuer n'est
+    // pas vendre, et la vente demande une reponse du MAPAQ.
+    elevage_offres: [
+      { id: 'of-1', module: 'poulailler', libelle: '6 gros œufs', contenants: 4,
+        date_offre: jourCourt(-2), notes: 'Ramassage de la fin de semaine' },
+      // Celle-ci est dans la machine : case 3. Elle se prend a la machine,
+      // pas depuis l'ecran — et c'est la machine qui consigne le retrait.
+      { id: 'of-2', module: 'poulailler', libelle: '12 œufs moyens', contenants: 2,
+        date_offre: jourCourt(-2), notes: 'Au froid', slot_num: 3,
+        machine_id: 'M1', created_at: jours(-2) },
+      { id: 'of-3', module: 'sablonponie', libelle: 'Truite ~540 g, vidée', contenants: 3,
+        date_offre: jourCourt(-9), notes: 'Deuxième récolte' },
+    ],
+
+    // Ce que la machine lunch a consigne. price = 0 : un retrait, pas un
+    // achat. Les achats payants d'un voisin ne sont pas lisibles ici.
+    lunch_transactions: [
+      { id: 'lt-1', slot_id: 'db-3', slot_num: 3, price: 0, buyer_name: 'Julien Moreau',
+        user_id: 'p3', created_at: jours(-1),
+        profiles: { full_name: 'Julien Moreau', unit: 'C-310' } },
+    ],
+
+    elevage_retraits: [
+      { id: 'rt-1', offre_id: 'of-1', user_id: 'p2', contenants: 1, retire_at: jours(-1),
+        profiles: { full_name: 'Camille Bernard', unit: 'A-101' } },
+      { id: 'rt-2', offre_id: 'of-3', user_id: 'p3', contenants: 1, retire_at: jours(-8),
+        profiles: { full_name: 'Julien Moreau', unit: 'C-310' } },
+    ],
+
+    // Un resident s'occupe du poulailler — c'est le compte de la
+    // demonstration lui-meme, pour que le formulaire de saisie apparaisse.
+    elevage_operateurs: [
+      { id: 'eo-1', module: 'poulailler', user_id: MOI,
+        profiles: { full_name: 'Alex Tremblay', unit: 'B-204' } },
+    ],
+
+    // Lots de la sablonponie. Un lot d'engraissement, un de geniteurs
+    // separes par sexe — c'est ainsi qu'on les tient en bassins distincts.
+    elevage_lots: [
+      { id: 'el-1', module: 'sablonponie', espece: 'Truite arc-en-ciel',
+        date_mise_en_bassin: jourCourt(-260), quantite_initiale: 40, stade: 'marchand',
+        sexe: 'mixte', poids_moyen_g: 540, date_recolte_prevue: jourCourt(20),
+        notes: 'Lot principal — récolté en deux fois jusqu’ici' },
+      { id: 'el-2', module: 'sablonponie', espece: 'Truite arc-en-ciel',
+        date_mise_en_bassin: jourCourt(-45), quantite_initiale: 60, stade: 'juvenile',
+        sexe: 'mixte', poids_moyen_g: 95, date_recolte_prevue: jourCourt(180),
+        notes: 'Relève du lot principal' },
+      { id: 'el-3', module: 'sablonponie', espece: 'Truite arc-en-ciel',
+        date_mise_en_bassin: jourCourt(-400), quantite_initiale: 4, stade: 'reproduction',
+        sexe: 'femelle', poids_moyen_g: 1250, notes: 'Femelles gardées pour la fraie' },
+      { id: 'el-4', module: 'sablonponie', espece: 'Truite arc-en-ciel',
+        date_mise_en_bassin: jourCourt(-400), quantite_initiale: 2, stade: 'reproduction',
+        sexe: 'male', poids_moyen_g: 1100, notes: 'Mâles, bassin séparé' },
+    ],
+
+    // ── Elevages : poulailler et sablonponie ─────────────────
+    // Les deux ecrans etaient vides en demonstration, ce qui donnait a
+    // croire que la fonction n'existait pas. Un mois de ponte et deux
+    // recoltes suffisent a montrer les totaux et le cout unitaire.
+    elevage_historique: [
+      // Poulailler : six poules, une perte, la ponte des dernieres semaines.
+      { id: 'eh-1', module: 'poulailler', date_evenement: jourCourt(-300), type_evenement: 'ajout', quantite: 4, description: 'Quatre poules rousses' },
+      { id: 'eh-10', module: 'poulailler', date_evenement: jourCourt(-40),  type_evenement: 'ajout', quantite: 1, description: 'Petite Crête, en remplacement de Coquette', animal_id: 'ea-4' },
+      { id: 'eh-3', module: 'poulailler', date_evenement: jourCourt(-40),  type_evenement: 'ponte', quantite: 88, description: 'Cumul de la semaine' },
+      { id: 'eh-4', module: 'poulailler', date_evenement: jourCourt(-26),  type_evenement: 'ponte', quantite: 92, description: 'Cumul de la semaine' },
+      { id: 'eh-5', module: 'poulailler', date_evenement: jourCourt(-12),  type_evenement: 'ponte', quantite: 79, description: 'Cumul de la semaine — chaleur',
+        ponte_petit: 18, ponte_moyen: 38, ponte_gros: 19, ponte_defaut_comestible: 2, ponte_defaut_rejet: 2 },
+      { id: 'eh-6', module: 'poulailler', date_evenement: jourCourt(-4),   type_evenement: 'ponte', quantite: 90, description: 'Cumul de la semaine',
+        ponte_petit: 21, ponte_moyen: 44, ponte_gros: 22, ponte_defaut_comestible: 3, ponte_defaut_rejet: 0 },
+      { id: 'eh-7', module: 'poulailler', date_evenement: jourCourt(-18),  type_evenement: 'sante', quantite: null, description: 'Traitement antiparasitaire, tout le troupeau' },
+      // Deux evenements nominatifs : le reste appartient au troupeau.
+      { id: 'eh-8', module: 'poulailler', date_evenement: jourCourt(-96),  type_evenement: 'perte', quantite: 1, description: 'Prédation — renard, clôture renforcée depuis', animal_id: 'ea-5' },
+      { id: 'eh-9', module: 'poulailler', date_evenement: jourCourt(-33),  type_evenement: 'sante', quantite: null, description: 'Blessure à une patte — boiterie, puis rétablissement complet en trois jours', animal_id: 'ea-1' },
+      // Un projet se consigne en note : les deux Chantecler n'existent pas
+      // encore, leur donner une fiche affirmerait un cheptel faux.
+      { id: 'eh-14', module: 'poulailler', date_evenement: jourCourt(-36), type_evenement: 'sante', quantite: null,
+        description: 'Patte enflée remarquée au matin — isolée pour la journée', animal_id: 'ea-1' },
+      { id: 'eh-11', module: 'poulailler', date_evenement: jourCourt(-6), type_evenement: 'note', quantite: null,
+        description: 'Deux Chantecler prévues au printemps, en remplacement de Doucette et Long Bec (âgées). Le règlement plafonne à 4 : leur départ doit précéder l’arrivée.' },
+      // Sablonponie : truites arc-en-ciel, deux recoltes.
+      { id: 'ep-1', module: 'sablonponie', date_evenement: jourCourt(-260), type_evenement: 'ajout', quantite: 40, description: 'Alevins de truite arc-en-ciel' },
+      { id: 'ep-2', module: 'sablonponie', date_evenement: jourCourt(-190), type_evenement: 'perte', quantite: 3,  description: 'Mortalité à l’acclimatation' },
+      { id: 'ep-3', module: 'sablonponie', date_evenement: jourCourt(-70),  type_evenement: 'recolte', quantite: 4.2, description: 'Première récolte',
+        lot_id: 'el-1', recolte_petit: 1, recolte_moyen: 5, recolte_gros: 2, recolte_rejet: 0 },
+      { id: 'ep-4', module: 'sablonponie', date_evenement: jourCourt(-9),   type_evenement: 'recolte', quantite: 5.6, description: 'Deuxième récolte',
+        lot_id: 'el-1', recolte_petit: 0, recolte_moyen: 6, recolte_gros: 4, recolte_rejet: 1 },
+      { id: 'ep-5', module: 'sablonponie', date_evenement: jourCourt(-30),  type_evenement: 'note', quantite: null, description: 'Backwash dirigé vers les planches 1 à 3' },
+    ],
+
+    elevage_couts: [
+      { id: 'ec-1', module: 'poulailler', date_cout: jourCourt(-120), categorie: 'Nourriture', montant: 78.40, description: 'Moulée, 3 sacs' },
+      { id: 'ec-2', module: 'poulailler', date_cout: jourCourt(-60),  categorie: 'Nourriture', montant: 52.30, description: 'Moulée, 2 sacs' },
+      { id: 'ec-3', module: 'poulailler', date_cout: jourCourt(-45),  categorie: 'Litière',    montant: 24.00, description: 'Copeaux' },
+      { id: 'ec-4', module: 'poulailler', date_cout: jourCourt(-18),  categorie: 'Vétérinaire', montant: 40.00, description: 'Antiparasitaire' },
+      { id: 'ec-5', module: 'sablonponie', date_cout: jourCourt(-200), categorie: 'Équipement', montant: 210.00, description: 'Pompe de secours' },
+      { id: 'ec-6', module: 'sablonponie', date_cout: jourCourt(-85),  categorie: 'Nourriture', montant: 96.75, description: 'Granulés, 25 kg' },
+      { id: 'ec-7', module: 'sablonponie', date_cout: jourCourt(-20),  categorie: 'Énergie',    montant: 61.20, description: 'Part de l’aération, relevé trimestriel' },
+    ],
+
+    // ── Reglages ─────────────────────────────────────────────
+    system_settings: [
+      { key: 'elevage_capacite_poulailler', value: '4' },
+      { key: 'elevage_capacite_sablonponie', value: '' },
+      { key: 'module_trips', value: 'true' },
+      { key: 'module_lunch', value: 'true' },
+      { key: 'module_serre', value: 'true' },
+      { key: 'module_energie', value: 'true' },
+      { key: 'lunch_mode', value: 'demo',
+        description: 'Configuration de la Machine Lunch : demo, local ou central' },
+      { key: 'lunch_local_url', value: '',
+        description: 'Adresse du kiosque sur le réseau du bâtiment' },
+      { key: 'finance_central_enabled', value: 'false' },
+      { key: 'federation_enabled', value: 'false' },
+      { key: 'building_name', value: 'Immeuble de démonstration' },
+    ],
+
+    // Frais d'exploitation du parc, cote administration.
+    vehicle_couts: [
+      { id: 'vc-1', vehicle_id: null,   date_cout: jourCourt(-80), categorie: 'assurance',
+        nature: 'fixe', montant: 1150.00, description: 'Assurance flotte, trimestre' },
+      { id: 'vc-2', vehicle_id: null,   date_cout: jourCourt(-74), categorie: 'reseau_recharge',
+        nature: 'fixe', montant: 300.00, description: 'Entretien des bornes du sous-sol' },
+      { id: 'vc-3', vehicle_id: 'vh-1', date_cout: jourCourt(-60), categorie: 'amortissement',
+        nature: 'fixe', montant: 1575.00, description: 'Amortissement trimestriel' },
+      { id: 'vc-4', vehicle_id: 'vh-4', date_cout: jourCourt(-60), categorie: 'amortissement',
+        nature: 'fixe', montant: 1575.00, description: 'Amortissement trimestriel' },
+      { id: 'vc-5', vehicle_id: null,   date_cout: jourCourt(-45), categorie: 'recharge',
+        nature: 'variable', montant: 480.00, description: 'Électricité, relevé Hydro' },
+      { id: 'vc-6', vehicle_id: 'vh-1', date_cout: jourCourt(-30), categorie: 'entretien',
+        nature: 'variable', montant: 280.00, description: 'Entretien 20 000 km' },
+      { id: 'vc-7', vehicle_id: 'vh-4', date_cout: jourCourt(-12), categorie: 'pneus',
+        nature: 'variable', montant: 680.00, description: 'Pneus quatre saisons' },
+      { id: 'vc-8', vehicle_id: 'vh-2', date_cout: jourCourt(-20), categorie: 'entretien',
+        nature: 'variable', montant: 60.00, description: 'Révision vélomobile' },
+    ],
+
+    resource_access: [
+      { id: 'ra-1', user_id: MOI, resource_type: 'space', resource_id: 'sp-1' },
+      { id: 'ra-2', user_id: MOI, resource_type: 'space', resource_id: 'sp-2' },
+      { id: 'ra-3', user_id: MOI, resource_type: 'space', resource_id: 'sp-3' },
+      { id: 'ra-4', user_id: MOI, resource_type: 'space', resource_id: 'sp-4' },
+      { id: 'ra-5', user_id: MOI, resource_type: 'vehicle', resource_id: 'vh-1' },
+      { id: 'ra-6', user_id: MOI, resource_type: 'vehicle', resource_id: 'vh-2' },
+      { id: 'ra-7', user_id: MOI, resource_type: 'vehicle', resource_id: 'vh-3' },
+      { id: 'ra-8', user_id: MOI, resource_type: 'vehicle', resource_id: 'vh-4' },
+    ],
+
+    // Vues d'administration : vides, la demo est cote locataire.
+    stats_spaces: [], stats_tenants: [], stats_vehicles: [],
+    deletion_requests: [], reservation_requests: [], driver_offers: [],
+    notifications: [], usage_logs: [],
+  };
+
+  // Reponses des RPC appelees par l'interface. Une RPC absente
+  // renvoie null sans erreur : l'appelant traite deja ce cas.
+  var RPC = {
+    check_space_availability: function () { return true; },
+    // Meme regle que la fonction SQL : des moyennes seulement, et rien
+    // sous trois logements mesures.
+    eau_chaude_moyenne: function (a) {
+      var totaux = {};
+      (DEMO.eau_chaude_compteurs || []).forEach(function (c) {
+        if (c.jour >= a.p_debut && c.jour <= a.p_fin) totaux[c.unit] = (totaux[c.unit] || 0) + Number(c.litres);
+      });
+      var valeurs = Object.keys(totaux).map(function (k) { return totaux[k]; });
+      if (valeurs.length < 3) return [];
+      var moy = valeurs.reduce(function (s, v) { return s + v; }, 0) / valeurs.length;
+      return [{ litres_moyens: Math.round(moy * 10) / 10, nb_logements: valeurs.length }];
+    },
+    // Repond vraiment, plutot que « oui » systematiquement : en
+    // demonstration on peut desormais reserver un vehicule, et un parcours
+    // qui accepte un creneau deja pris n'apprend rien a personne. Meme
+    // regle que la fonction SQL — reservations ET trajets publies, deux
+    // heures par trajet sans heure d'arrivee.
+    vehicle_marge: function (a) {
+      var dans = function (d) { return d >= a.p_debut && d <= a.p_fin; };
+      var res = (DEMO.vehicle_reservations || []).filter(function (r) {
+        return r.status === 'completed' && r.returned_at && dans(r.returned_at.slice(0, 10));
+      });
+      var somme = function (t, f) { return t.reduce(function (n, x) { return n + (Number(f(x)) || 0); }, 0); };
+      var revenus = somme(res, function (r) { return r.total_cost; });
+      var minutes = somme(res, function (r) { return r.total_minutes; });
+      var km      = somme(res, function (r) { return r.total_km; });
+      var couts   = (DEMO.vehicle_couts || []).filter(function (c) { return dans(c.date_cout); });
+      var fixes   = somme(couts.filter(function (c) { return c.nature === 'fixe'; }),     function (c) { return c.montant; });
+      var vari    = somme(couts.filter(function (c) { return c.nature === 'variable'; }), function (c) { return c.montant; });
+      var marge   = revenus - (fixes + vari);
+      var cible   = Number(a.p_marge_cible) || 0.15;
+      var r2 = function (x) { return Math.round(x * 100) / 100; };
+      var r4 = function (x) { return Math.round(x * 10000) / 10000; };
+      return {
+        revenus: r2(revenus), couts_fixes: r2(fixes), couts_variables: r2(vari),
+        couts: r2(fixes + vari), marge: r2(marge),
+        taux: revenus > 0 ? r4(marge / revenus) : null,
+        minutes: minutes, km: Math.round(km * 10) / 10,
+        tarif_min_cible: minutes > 0 ? r4(fixes / minutes / (1 - cible)) : null,
+        tarif_km_cible:  km > 0      ? r4(vari / km / (1 - cible))      : null,
+        marge_cible: cible
+      };
+    },
+    vehicle_pickup: function (a) {
+      var r = (DEMO.vehicle_reservations || []).find(function (x) { return x.id === a.p_reservation_id; });
+      if (!r) return null;
+      var v = (DEMO.vehicles || []).find(function (x) { return x.id === r.vehicle_id; });
+      var attendu = (v && Number(v.odometer_km)) || 0;
+      var ecart = Math.round((a.p_km - attendu) * 10) / 10;
+      r.km_start = a.p_km;
+      r.km_ecart = ecart || null;
+      r.started_at = new Date().toISOString();
+      r.status = 'in_progress';
+      if (v) v.odometer_km = a.p_km;
+      return { km_attendu: attendu, ecart: ecart };
+    },
+    vehicle_return: function (a) {
+      var r = (DEMO.vehicle_reservations || []).find(function (x) { return x.id === a.p_reservation_id; });
+      if (!r) return null;
+      var v = (DEMO.vehicles || []).find(function (x) { return x.id === r.vehicle_id; });
+      var tarifs = (v && v.vehicle_pricing && v.vehicle_pricing[0]) || {};
+      var minutes = Math.max(1, Math.ceil((Date.now() - new Date(r.started_at).getTime()) / 60000));
+      var distance = Math.round((a.p_km - (Number(r.km_start) || 0)) * 10) / 10;
+      var temps = Math.round(minutes * (Number(tarifs.price_per_minute) || 0) * 100) / 100;
+      var km = Math.round(distance * (Number(tarifs.price_per_km) || 0) * 100) / 100;
+      var total = Math.round((temps + km) * 100) / 100;
+      var acompte = Number(r.deposit_cost) || 0;
+      r.km_end = a.p_km;
+      r.total_km = distance;
+      r.total_minutes = minutes;
+      r.time_cost = temps;
+      r.km_cost = km;
+      r.total_cost = total;
+      r.returned_at = new Date().toISOString();
+      r.status = 'completed';
+      if (v) v.odometer_km = a.p_km;
+      return {
+        minutes: minutes, distance: distance, time_cost: temps, km_cost: km,
+        total: total, deposit: acompte, delta: Math.round((total - acompte) * 100) / 100
+      };
+    },
+    check_vehicle_availability: function (a) {
+      if (!a || !a.p_vehicle_id) return true;
+      var deb = new Date(a.p_start).getTime();
+      var fin = new Date(a.p_end).getTime();
+      var pris = (DEMO.vehicle_reservations || [])
+        .filter(function (r) {
+          return r.vehicle_id === a.p_vehicle_id
+            && (r.status === 'confirmed' || r.status === 'pending' || r.status === 'in_progress');
+        })
+        .map(function (r) { return [new Date(r.start_time).getTime(), new Date(r.end_time).getTime()]; });
+      (DEMO.trips || [])
+        .filter(function (t) { return t.vehicle_id === a.p_vehicle_id && t.status === 'published'; })
+        .forEach(function (t) {
+          var d = new Date(t.departure_time).getTime();
+          pris.push([d, d + 2 * 3600000]);
+        });
+      return !pris.some(function (c) { return deb < c[1] && fin > c[0]; });
+    },
+    vehicle_busy_slots: function () {
+      return (DEMO.vehicle_reservations || [])
+        .filter(function (r) {
+          return r.status === 'confirmed' || r.status === 'pending' || r.status === 'in_progress';
+        })
+        .map(function (r) {
+          return { vehicle_id: r.vehicle_id, debut: r.start_time, fin: r.end_time, source: 'reservation' };
+        })
+        .concat((DEMO.trips || [])
+          .filter(function (t) { return t.status === 'published'; })
+          .map(function (t) {
+            return {
+              vehicle_id: t.vehicle_id,
+              debut: t.departure_time,
+              fin: new Date(new Date(t.departure_time).getTime() + 2 * 3600000).toISOString(),
+              source: 'trajet',
+            };
+          }));
+    },
+    count_open_tickets: function () { return 1; },
+    serre_occupancy: function () { return [{ zone_id: 'sz-1', occupee: true }]; },
+    insert_usage_log: function () { return null; },
+    adjust_balance: function () { return 47.50; },
+    solde_debiter: function () { return 47.50; },
+    solde_rembourser: function () { return 47.50; },
+    admin_crediter: function () { return 47.50; },
+    trajet_confirmer: function () { return { passagers: 0, total_passagers: 0, credit_chauffeur: 0, solde_chauffeur: 47.50 }; },
+    list_client_invoices: function () { return []; },
+    get_invoice_detail: function () { return []; },
+    export_client_data: function () { return { demo: true }; },
+  };
+
+  // ── Client de demonstration ────────────────────────────────
+  function compare(a, b) {
+    if (a === b) return 0;
+    if (a === null || a === undefined) return -1;
+    if (b === null || b === undefined) return 1;
+    return a < b ? -1 : 1;
+  }
+
+  function egal(valeur, attendu) {
+    if (valeur === attendu) return true;
+    // PostgREST compare des chaines : 'true' == true, '3' == 3.
+    return String(valeur) === String(attendu);
+  }
+
+  var compteur = 0;
+  function idDemo(table) { return 'demo-' + table + '-' + (++compteur); }
+
+  function creerRequete(table, donnees) {
+    // On travaille sur une copie pour filtrer, mais les ecritures visent
+    // le tableau reel : une reservation creee pendant une demonstration
+    // doit apparaitre dans la liste juste apres.
+    if (!donnees[table]) donnees[table] = [];
+    var source = donnees[table];
+    var lignes = source.slice();
+    var tris = [];
+    var borne = null;
+    var mode = null;   // 'single' | 'maybeSingle'
+    var op = null;     // ecriture differee : les filtres arrivent APRES
+                       // .update()/.delete() dans l'API supabase-js
+
+    var req = {
+      // La projection est ignoree : les lignes du jeu portent deja
+      // leurs jointures. On garde la methode pour le chainage.
+      select: function () { return req; },
+      insert: function (rows) { op = { kind: 'insert', rows: rows }; return req; },
+      update: function (patch) { op = { kind: 'update', patch: patch }; return req; },
+      // onConflict indique la ou les colonnes qui identifient la ligne.
+      // Toutes les tables n'ont pas d'id : system_settings est cle par
+      // `key`, et un upsert qui ne regarderait que l'id y creerait des
+      // doublons au lieu de mettre a jour.
+      upsert: function (row, opts) {
+        op = {
+          kind: 'upsert',
+          row: row,
+          cles: ((opts && opts.onConflict) || 'id').split(',').map(function (c) { return c.trim(); }),
+        };
+        return req;
+      },
+      delete: function () { op = { kind: 'delete' }; return req; },
+
+      eq: function (col, val) { lignes = lignes.filter(function (r) { return egal(r[col], val); }); return req; },
+      neq: function (col, val) { lignes = lignes.filter(function (r) { return !egal(r[col], val); }); return req; },
+      gt: function (col, val) { lignes = lignes.filter(function (r) { return compare(r[col], val) > 0; }); return req; },
+      gte: function (col, val) { lignes = lignes.filter(function (r) { return compare(r[col], val) >= 0; }); return req; },
+      lt: function (col, val) { lignes = lignes.filter(function (r) { return compare(r[col], val) < 0; }); return req; },
+      lte: function (col, val) { lignes = lignes.filter(function (r) { return compare(r[col], val) <= 0; }); return req; },
+      in: function (col, vals) {
+        lignes = lignes.filter(function (r) {
+          return (vals || []).some(function (v) { return egal(r[col], v); });
+        });
+        return req;
+      },
+      is: function (col, val) {
+        lignes = lignes.filter(function (r) {
+          return val === null ? (r[col] === null || r[col] === undefined) : egal(r[col], val);
+        });
+        return req;
+      },
+      contains: function () { return req; },
+      or: function () { return req; },      // trop varie pour etre simule fidelement
+      like: function () { return req; },
+      ilike: function () { return req; },
+      not: function () { return req; },
+      filter: function (col, op, val) {
+        var m = { eq: 'eq', neq: 'neq', gt: 'gt', gte: 'gte', lt: 'lt', lte: 'lte' };
+        return m[op] ? req[m[op]](col, val) : req;
+      },
+      order: function (col, opts) {
+        tris.push({ col: col, asc: !opts || opts.ascending !== false });
+        return req;
+      },
+      limit: function (n) { borne = n; return req; },
+      range: function (a, b) { borne = (b - a) + 1; return req; },
+      single: function () { mode = 'single'; return req.then.call(req); },
+      maybeSingle: function () { mode = 'maybeSingle'; return req.then.call(req); },
+
+      then: function (resolve, reject) {
+        // Ecritures : elles s'appliquent aux lignes retenues par les
+        // filtres accumules, puis retournent ce qu'elles ont touche.
+        if (op) {
+          var touchees = [];
+          if (op.kind === 'insert' || op.kind === 'upsert') {
+            var brutes = op.kind === 'insert' ? op.rows : [op.row];
+            if (!Array.isArray(brutes)) brutes = [brutes];
+            var cles = op.cles || ['id'];
+            brutes.forEach(function (r) {
+              var existante = null;
+              if (r && op.kind === 'upsert' && cles.every(function (c) { return r[c] !== undefined; })) {
+                existante = source.find(function (x) {
+                  return cles.every(function (c) { return String(x[c]) === String(r[c]); });
+                });
+              } else if (r && r.id) {
+                existante = source.find(function (x) { return String(x.id) === String(r.id); });
+              }
+              if (existante && op.kind === 'upsert') {
+                Object.assign(existante, r);
+                touchees.push(existante);
+              } else {
+                var ligne = Object.assign({ id: (r && r.id) || idDemo(table), created_at: new Date().toISOString() }, r);
+                source.push(ligne);
+                touchees.push(ligne);
+              }
+            });
+          } else if (op.kind === 'update') {
+            lignes.forEach(function (r) { Object.assign(r, op.patch); touchees.push(r); });
+          } else if (op.kind === 'delete') {
+            lignes.forEach(function (r) {
+              var i = source.indexOf(r);
+              if (i >= 0) source.splice(i, 1);
+              touchees.push(r);
+            });
+          }
+          var reponse = mode === 'single' || mode === 'maybeSingle'
+            ? { data: touchees[0] || null, error: null }
+            : { data: touchees, error: null };
+          var pe = Promise.resolve(reponse);
+          return resolve ? pe.then(resolve, reject) : pe;
+        }
+
+        var out = lignes.slice();
+        tris.forEach(function (t) {
+          out.sort(function (a, b) { return (t.asc ? 1 : -1) * compare(a[t.col], b[t.col]); });
+        });
+        if (borne !== null) out = out.slice(0, borne);
+
+        var res;
+        if (mode === 'single') {
+          res = out.length ? { data: out[0], error: null }
+                           : { data: null, error: { code: 'PGRST116', message: 'Aucune ligne (démo)' } };
+        } else if (mode === 'maybeSingle') {
+          res = { data: out[0] || null, error: null };
+        } else {
+          res = { data: out, error: null };
+        }
+        var p = Promise.resolve(res);
+        return resolve ? p.then(resolve, reject) : p;
+      },
+      catch: function (fn) { return req.then().catch(fn); },
+    };
+    return req;
+  }
+
+  function createDemoClient(donnees) {
+    var data = donnees || DEMO;
+    return {
+      _demo: true,
+      from: function (table) { return creerRequete(table, data); },
+      rpc: function (nom, args) {
+        var f = RPC[nom];
+        return Promise.resolve({ data: f ? f(args) : null, error: null });
+      },
+      functions: { invoke: function () { return Promise.resolve({ data: null, error: null }); } },
+      auth: {
+        onAuthStateChange: function () { return { data: { subscription: { unsubscribe: function () {} } } }; },
+        getSession: function () { return Promise.resolve({ data: { session: null }, error: null }); },
+        signInWithPassword: function () { return Promise.resolve({ data: null, error: { message: 'Mode démo' } }); },
+        signUp: function () { return Promise.resolve({ data: null, error: { message: 'Mode démo' } }); },
+        signOut: function () { return Promise.resolve({ error: null }); },
+        updateUser: function () { return Promise.resolve({ error: { message: 'Mode démo' } }); },
+        resetPasswordForEmail: function () { return Promise.resolve({ error: null }); },
+        stopAutoRefresh: function () { return Promise.resolve(); },
+      },
+    };
+  }
+
+  // ── REST de demonstration ────────────────────────────────
+  //
+  // La page Lunch n'utilise pas le client supabase-js : elle appelle
+  // cohFetch(), qui construit des URL PostgREST a la main. Le client de
+  // demonstration ne peut donc rien intercepter. Cette fonction remplace
+  // ces appels et couvre exactement la surface employee par cette page :
+  // filtres `eq`, `order`, `limit`, `select`, et POST / PATCH / DELETE.
+  //
+  // Elle ecrit vraiment dans DEMO, contrairement au reste du mode
+  // demonstration : rejoindre une file, la quitter et voir la place
+  // suivante devenir active n'aurait aucun interet en lecture seule. Les
+  // modifications vivent en memoire et disparaissent au rechargement.
+  function demoRest(chemin, opts) {
+    opts = opts || {};
+    var methode = (opts.method || 'GET').toUpperCase();
+    var coupe = String(chemin).split('?');
+    var table = coupe[0];
+    var params = new URLSearchParams(coupe[1] || '');
+
+    if (!Object.prototype.hasOwnProperty.call(DEMO, table)) return Promise.resolve([]);
+    var source = DEMO[table];
+
+    // Filtres : seule la forme `colonne=eq.valeur` est employee ici.
+    var lignes = source.filter(function (r) {
+      var garde = true;
+      params.forEach(function (v, k) {
+        if (k === 'select' || k === 'order' || k === 'limit') return;
+        if (v.indexOf('eq.') === 0 && String(r[k]) !== v.slice(3)) garde = false;
+      });
+      return garde;
+    });
+
+    var tri = params.get('order');
+    if (tri) {
+      var col = tri.split('.')[0], desc = /\.desc/.test(tri);
+      lignes = lignes.slice().sort(function (a, b) {
+        var x = a[col], y = b[col];
+        return (desc ? -1 : 1) * (x < y ? -1 : x > y ? 1 : 0);
+      });
+    }
+    var borne = params.get('limit');
+    if (borne) lignes = lignes.slice(0, parseInt(borne, 10));
+
+    if (methode === 'GET') return Promise.resolve(lignes);
+
+    var corps = null;
+    try { corps = opts.body ? JSON.parse(opts.body) : null; } catch (e) { corps = null; }
+
+    if (methode === 'POST') {
+      var neuve = Object.assign(
+        { id: table + '-' + Math.random().toString(16).slice(2, 8) }, corps);
+      source.push(neuve);
+      return Promise.resolve([neuve]);
+    }
+    if (methode === 'PATCH') {
+      lignes.forEach(function (r) { Object.assign(r, corps); });
+      return Promise.resolve(lignes);
+    }
+    if (methode === 'DELETE') {
+      lignes.forEach(function (r) {
+        var i = source.indexOf(r);
+        if (i >= 0) source.splice(i, 1);
+      });
+      return Promise.resolve(lignes);
+    }
+    return Promise.resolve([]);
+  }
+
+  // ── Historique du parc ───────────────────────────────────────────
+  // Le panneau d'administration rapproche les frais des revenus. Sans
+  // reservations rendues, il comparerait un trimestre de frais a une
+  // sortie de quarante minutes et afficherait des tarifs cibles absurdes
+  // — de quoi croire le calcul casse.
+  //
+  // On seme donc un trimestre plausible : deux minivans qui roulent
+  // presque tous les jours, deux velomobiles pris plus souvent mais plus
+  // brievement. Rien d'aleatoire — la demonstration doit donner les memes
+  // chiffres a chaque ouverture.
+  (function semerHistorique() {
+    var flotte = [
+      { id: 'vh-1', modele: 'Minivan électrique 1', plaque: 'MV-01', type: 'auto',
+        min: 0.20, km: 0.35, dureeBase: 95,  kmBase: 34, cadence: 1 },
+      { id: 'vh-4', modele: 'Minivan électrique 2', plaque: 'MV-02', type: 'auto',
+        min: 0.20, km: 0.35, dureeBase: 130, kmBase: 47, cadence: 1 },
+      { id: 'vh-2', modele: 'Vélomobile 1', plaque: 'VM-01', type: 'velomobile',
+        min: 0.02, km: 0, dureeBase: 70, kmBase: 12, cadence: 1 },
+      { id: 'vh-3', modele: 'Vélomobile 2', plaque: 'VM-02', type: 'velomobile',
+        min: 0.02, km: 0, dureeBase: 55, kmBase: 9, cadence: 2 },
+    ];
+    var gens = [MOI, 'p-2', 'p-3'];
+    var compteur = { 'vh-1': 14200, 'vh-2': 900, 'vh-3': 700, 'vh-4': 6800 };
+    var lignes = [];
+    var n = 0;
+
+    for (var j = 90; j >= 2; j--) {
+      for (var i = 0; i < flotte.length; i++) {
+        var f = flotte[i];
+        // Cadence deterministe : la minivan 1 sort tous les jours, la
+        // velomobile 2 un jour sur deux, etc.
+        if ((j + i) % f.cadence !== 0) continue;
+        n++;
+        // Variation reguliere autour de la base, pour que les durees et
+        // les distances ne soient pas toutes identiques.
+        var ecart   = ((j * 7 + i * 13) % 11) - 5;          // -5 a +5
+        var minutes = Math.max(20, f.dureeBase + ecart * 6);
+        var km      = f.kmBase ? Math.max(3, f.kmBase + ecart * 3) : 0;
+        var debut   = new Date(Date.now() - j * 86400000);
+        debut.setHours(8 + (i * 3 + j) % 10, 0, 0, 0);
+        var fin     = new Date(debut.getTime() + minutes * 60000);
+        var temps   = Math.round(minutes * f.min * 100) / 100;
+        var coutKm  = Math.round(km * f.km * 100) / 100;
+        var depart  = compteur[f.id];
+        compteur[f.id] = Math.round((depart + km) * 10) / 10;
+
+        lignes.push({
+          id: 'vrh-' + n, vehicle_id: f.id, tenant_id: gens[n % gens.length],
+          start_time: debut.toISOString(), end_time: fin.toISOString(),
+          started_at: debut.toISOString(), returned_at: fin.toISOString(),
+          total_minutes: minutes, total_km: km,
+          km_start: depart, km_end: compteur[f.id],
+          time_cost: temps, km_cost: coutKm,
+          deposit_cost: temps, total_cost: Math.round((temps + coutKm) * 100) / 100,
+          purpose: null, status: 'completed', created_at: debut.toISOString(),
+          vehicles: { model: f.modele, vehicle_type: f.type, license_plate: f.plaque },
+        });
+      }
+    }
+
+    // Les compteurs de la flotte suivent l'historique : le releve propose
+    // a la prise doit etre celui que le dernier retour a laisse.
+    DEMO.vehicles.forEach(function (v) {
+      if (compteur[v.id] != null) v.odometer_km = compteur[v.id];
+    });
+    (DEMO.vehicle_reservations || []).forEach(function (r) {
+      if (r.id === 'vr-3') r.km_start = compteur['vh-1'];
+      if (r.id === 'vr-4') r.km_start = null;
+    });
+    DEMO.vehicle_reservations = lignes.concat(DEMO.vehicle_reservations || []);
+  })();
+
+  global.COHABITAT_DEMO = DEMO;
+  global.createDemoClient = createDemoClient;
+  global.demoRest = demoRest;
+})(window);

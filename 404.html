@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>Page introuvable — CoHabitat</title>
+  <script>
+    // Adresse inconnue du site.
+    //
+    // Une adresse de page (ex. un lien de courriel vers /reinitialiser) est
+    // renvoyée à l'accueil DU MÊME SITE, avec sa requête et son #fragment :
+    // le fragment peut porter un jeton de connexion Supabase (lien de
+    // réinitialisation) ; il ne doit jamais partir vers un autre domaine.
+    // index.html le lit directement dans l'adresse (type=recovery).
+    //
+    // Une adresse de fichier (.sql, .md, .js…) reste une vraie page 404 :
+    // rien à rediriger.
+    (function () {
+      var path = window.location.pathname;
+      if (/\.[a-z0-9]+$/i.test(path)) return;
+      // Sans domaine propre, le site vit sous utilisateur.github.io/depot/.
+      var base = '/';
+      if (/\.github\.io$/i.test(window.location.hostname)) {
+        var premier = path.split('/')[1];
+        if (premier) base = '/' + premier + '/';
+      }
+      if (path === base) return;   // jamais de boucle
+      window.location.replace(base + window.location.search + window.location.hash);
+    })();
+  </script>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #f7f5f0; color: #1a1a1a;
+           display: flex; min-height: 100vh; align-items: center; justify-content: center;
+           margin: 0; padding: 16px; }
+    a { color: #2d7a4f; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Page introuvable</h1>
+    <p><a href="/">Retour à CoHabitat</a></p>
+  </main>
+</body>
+</html>
